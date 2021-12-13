@@ -1,30 +1,27 @@
-import json
-from datetime import datetime, timedelta, timezone
-
 import os
 import logging
-import traceback
-
+import json
+from datetime import datetime, timedelta, timezone
 import boto3
 from boto3.dynamodb.conditions import Key
-
 from linebot import (LineBotApi, WebhookHandler)
-from linebot.models import (MessageEvent, TextMessage, TextSendMessage, TemplateSendMessage, ButtonsTemplate, PostbackEvent)
+from linebot.models import (MessageEvent, TextMessage, TextSendMessage, TemplateSendMessage, ButtonsTemplate, PostbackEvent, UnfollowEvent)
 from linebot.exceptions import (LineBotApiError, InvalidSignatureError)
 
-
 GUIDE_TEXT = """\
-ごみ捨て支援BOT
+ごみすて支援ボット 53ST
 
-毎朝７時にごみ捨て通知が届きます。
-通知内容は曜日ごとに任意に設定できます。
+毎朝７時にごみすて通知を送信するよ。
+通知内容は曜日ごとに自由に設定できます。
+
+トーク画面で何かメッセージを送信するとメニュー画面を開きます。
 
 プライバシーについて
-設定状態の保持のためLINEアカウントの識別IDを暗号化して保存します。
-友だち削除すると設定も削除されます。
+友だち追加時に発行される識別IDを用いて設定情報を管理します。
+識別IDは通知の送信以外の用途には使用いたしません。
+ブロックしたり友だち削除すると設定情報は削除されます。
 
-ver.1.0 2021 yuuki1036
-"""
+ver.1.0 2021 yuuki1036"""
 
 WEEK_NAMES = ['月', '火', '水', '木', '金', '土', '日']
 
@@ -41,38 +38,48 @@ JST = timezone(timedelta(hours=+9), 'JST')
 now = datetime.now(JST)
 timestamp = f"{now:%Y/%m/%d %H:%M:%S}"
 
-handler = WebhookHandler(CHANNEL_SECRET)
+# LINE BOT API
 line_bot_api = LineBotApi(channel_access_token=CHANNEL_TOKEN)
+handler = WebhookHandler(CHANNEL_SECRET)
 
-# user情報取得
+# dynamoDB接続
+def connectDB(user_id):
+    db = boto3.resource('dynamodb')
+    table = db.Table('trash-disposal-notification')
+    return table
+
+# IDからuser情報取得
 def getUserData(user_id):
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('trash-disposal-notification')
-    res = table.query(
-        KeyConditionExpression=Key('id').eq(user_id)
-    )
+    table = connectDB(user_id)
+    res = table.query(KeyConditionExpression=Key('id').eq(user_id))
     return res['Items'][0] if res['Items'] else None
 
-# user情報作成
+# user情報新規作成
 def createUserData(user_id, user_name):
+    setting = ['なし'] * 7
     item = {
         'id': user_id,
         'name': user_name,
-        'setting': ['なし', 'なし', 'なし', 'なし', 'なし', 'なし', 'なし'],
+        'setting': setting,
         'state': '99',
         'create': timestamp,
     }
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('trash-disposal-notification')
+    table = connectDB(user_id)
     res = table.put_item(Item=item)
     return
 
-# state更新
 """
-0 - 6: 曜日設定中
-99   : デフォルト
+state変更
+
+stateはメッセージ受付処理の状態
+0 - 6: 予定を設定する（曜日番号に対応）
+99   : デフォルト（メニューを返す）
+
+曜日設定に進んだ場合は
+月曜から日曜まで設定し直したあと、デフォルトに戻る
 """
 def changeState(user_data):
+    # state変更
     user_id = user_data['id']
     state = int(user_data['state'])
     if state == 99:
@@ -84,8 +91,7 @@ def changeState(user_data):
     user_data['state'] = str(state)
     
     # db更新
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('trash-disposal-notification')
+    table = connectDB(user_id)
     table.update_item(
         Key={'id': user_id},
         UpdateExpression="set #state=:s",
@@ -101,14 +107,20 @@ def updateSetting(user_data, value):
     state = int(user_data['state'])
     setting[state] = value
     
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('trash-disposal-notification')
+    table = connectDB(user_id)
     table.update_item(
         Key={'id': user_id},
         UpdateExpression="set #setting=:s",
         ExpressionAttributeNames={'#setting': 'setting'},
         ExpressionAttributeValues={':s': setting}
     )
+    return
+
+# user情報削除
+def deleteSetting(user_id):
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table('trash-disposal-notification')
+    table.delete_item(Key={'id': user_id})
     return
 
 # 設定状態テキスト作成
@@ -129,18 +141,17 @@ def createMainMenu(user_data, text):
             actions=[
                 {
                     'type': 'postback',
-                    'data': '{"mode":"setting"}',
+                    'data': 'setting',
                     'label': '通知設定', 
                 },
                 {
                     'type': 'postback',
-                    'data': '{"mode":"guide"}',
+                    'data': 'guide',
                     'label': '使い方', 
                 },
             ]
         )
     )
-
 
 # 設定入力メッセージ作成
 def createSettingMessage(user_data):
@@ -148,7 +159,7 @@ def createSettingMessage(user_data):
     day_name = WEEK_NAMES[idx]
     now_value = user_data['setting'][idx]
     now_text = f"通知なし"  if now_value == 'なし' else f"「{now_value}」"
-    text = f"{day_name}曜日の予定を入力してね。\n現在の設定は{now_text}です。\n通知が不要な場合は「なし」と入力してね。\n\n例：燃えるごみ, ダンボールなど"
+    text = f"{day_name}曜日の予定を10文字以内で入力してね。\n現在の設定は{now_text}です。\n通知が不要な場合は「なし」と入力してね。\n\n例：燃えるごみ, ダンボールなど"
     return TextSendMessage(text=text)
 
 # ガイドメッセージ作成
@@ -158,7 +169,6 @@ def createGuide():
 
 def lambda_handler(event, context):
     
-    logger.info(event)
     if "x-line-signature" in event["headers"]:
         signature = event["headers"]["x-line-signature"]
         
@@ -167,56 +177,81 @@ def lambda_handler(event, context):
     # メッセージを受信したとき
     @handler.add(MessageEvent, message=TextMessage)
     def onMessage(line_event):
-        # 送信元id
-        user_id = line_event.source.user_id
         # user情報取得
+        user_id = line_event.source.user_id
         user_data = getUserData(user_id)
         
         if user_data:
+            # stateを確認
             state = int(user_data['state'])
             if state == 99:
-                # user情報が存在するのでメインメニュー表示
+                # メインメニュー表示
                 message = createMainMenu(user_data, "お呼びですか？")
             else:
+                # 予定設定処理
                 # 受信メッセージをuser情報に登録する
                 value = line_event.message.text
+                # 値は10文字以内
+                value = value if len(value) <= 10 else value[:10]
+                # DB更新
                 updateSetting(user_data, value)
+                # 更新後に再取得
                 user_data = changeState(user_data)
-                
                 state = int(user_data['state'])
                 if state == 99:
+                    # 予定設定完了
                     message = createMainMenu(user_data, "設定が完了したよ！")
+                    logger.info(f"{user_data['name']} 設定完了")
                 else:
+                    # 次の曜日の予定設定
                     message = createSettingMessage(user_data)
         else:
-            # user情報作成後にメインメニュー表示
+            # user情報作成
             user_name = line_bot_api.get_profile(user_id).display_name
             createUserData(user_id, user_name)
             user_data = getUserData(user_id)
+            logger.info(f"{user_name} 新規作成")
+            # メインメニュー表示
             message = createMainMenu(user_data, "まずは予定を設定してね！")
         
         # オウム返し
         # message = TextSendMessage(text=line_event.message.text)
-            
+        
+        # 返答する
         line_bot_api.reply_message(line_event.reply_token, message)
     
-    # 選択肢を選んだとき
+    
+    # 何らかの選択肢を選んだとき
     @handler.add(PostbackEvent)
     def onPostback(line_event):
-        res = json.loads(line_event.postback.data)
-        logger.info(f"POSTBACK RESPONSE => {res}")
-        mode = res['mode']
+        mode = line_event.postback.data
         if mode == "guide":
+            # 使い方
             message = createGuide()
         elif mode == 'setting':
-            # 送信元id
-            user_id = line_event.source.user_id
+            # 予定設定
             # user情報取得
+            user_id = line_event.source.user_id
             user_data = getUserData(user_id)
+            # stateを予定設定に変更
             user_data = changeState(user_data)
+            # 予定の入力を促すメッセージ作成
             message = createSettingMessage(user_data)
         
+        # 返答する
         line_bot_api.reply_message(line_event.reply_token, message)
+    
+    # 友だち削除またはブロックされたとき    
+    @handler.add(UnfollowEvent)
+    def onUnFollow(line_event):
+        # 送信元id
+        user_id = line_event.source.user_id
+        # user情報削除
+        user_data = getUserData(user_id)
+        if user_data:
+            deleteSetting(user_id)
+            logger.info(f"削除 {user_data['name']}")
+        return
         
         
     ok_json = {
